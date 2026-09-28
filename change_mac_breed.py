@@ -99,6 +99,43 @@ def wait_for_breed_via_ping():
             return True
         time.sleep(0.5)
 
+# Кандидаты ребута в веб-интерфейсе Breed. Точный путь зависит от сборки,
+# поэтому пробуем по очереди и проверяем результат по пингу.
+REBOOT_PATHS = ["/reboot", "/reboot.html", "/index.html?reboot", "/"]
+
+def try_reboot_via_breed():
+    """Пытается перезагрузить роутер средствами самого Breed.
+
+    Возвращает True, если Breed принял команду. Обработчик ребута в Breed
+    отвечает сразу и стартует перезагрузку, поэтому по коду ответа судим
+    только, что путь существует (200/302), а не что ребут реально начался.
+    """
+    for path in REBOOT_PATHS:
+        url = f"http://{ROUTER_IP}{path}"
+        print(f"[*] Пробую ребут через Breed: {path}")
+        try:
+            proc = subprocess.run(
+                ["curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
+                 "--max-time", "5", "-X", "POST", url],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=8, text=True,
+            )
+            code = (proc.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            print("    [i] Таймаут (возможно, Breed уже уходит в ребут - это хорошо)")
+            return True
+        except Exception as e:
+            print(f"    [i] Ошибка запроса: {e}")
+            continue
+
+        if code in ("200", "302", "303"):
+            print(f"    [+] Breed ответил {code} на {path}")
+            return True
+        print(f"    [-] {path} -> HTTP {code or 'нет ответа'}")
+
+    return False
+
+
 def send_mac_via_system_curl(mac_data):
     print("[*] Формируем пакет данных для отправки через системный curl...")
     

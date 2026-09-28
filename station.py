@@ -6,7 +6,7 @@
 запрашивает MAC с корпуса, дальше отрабатывает пайплайн:
 
     1. change_mac_breed.py  - считает +0/+1/+2 от базового MAC и пишет в Breed
-    2. ждём ребут роутера   - Breed сам не перезагружается, жмём питание
+    2. ребут через Breed     - команда на перезагрузку, при неудаче жмём питание
     3. autoflash_wiveng.py  - заливка U-Boot, затем из него Wive-NG
     4. check_wive.py        - приёмка: логин в Wive-NG и сверка MAC
 
@@ -39,6 +39,10 @@ C_YELLOW = "\033[93m"
 C_CYAN = "\033[96m"
 
 REQUIRED_FILES = ["uboot-s1010-wive.bin", "wive-ng-s1010.bin"]
+
+# Кандидаты обработчика перезагрузки в веб-интерфейсе Breed.
+# Точный путь зависит от сборки, поэтому перебираем и проверяем фактом.
+REBOOT_PATHS = ["/reboot", "/reboot.html", "/index.html?reboot", "/"]
 
 _stop = False
 
@@ -74,8 +78,10 @@ def fmt(mac):
 
 
 def ping_router(ip):
+    # -n не резолвит имя; порт в адресе, если задан, отбрасываем
+    host = ip.split(":")[0]
     proc = subprocess.run(
-        ["ping", "-c", "1", "-W", "1", "-n", ip],
+        ["ping", "-c", "1", "-W", "1", "-n", host],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -100,17 +106,82 @@ def wait_for_router(ip, interval=1.0):
     return False
 
 
-def wait_router_back(ip, gone_timeout=60, back_timeout=120):
-    """Ждёт ребута роутера: сначала пропадания, затем возвращения.
+def try_reboot_via_breed(ip, timeout=15):
+    """Пробует перезагрузить роутер средствами веб-интерфейса Breed.
 
-    Breed после правки MAC сам не перезагружается, перезагрузку делает
-    оператор кнопкой питания. Если роутер не пропал (очень быстрый
-    ребут), просто ждём его возвращения.
+    У Breed есть собственный обработчик перезагрузки, поэтому обходимся
+    без нажатия кнопки питания. Точный путь зависит от сборки Breed,
+    поэтому перебираем несколько кандидатов. Успех определяем не по
+    коду ответа, а по факту: роутер должен пропасть из сети.
+    """
+    for path in REBOOT_PATHS:
+        # ip может содержать порт ("192.168.1.1:8080") - тогда не добавляем
+        # двоеточие лишний раз
+        host = ip if ":" in ip else f"{ip}:80"
+        url = f"http://{host}{path}"
+        print(f"  пробую ребут через Breed: {path}")
+        try:
+            subprocess.run(
+                ["curl", "-s", "-o", os.devnull, "--max-time", "5",
+                 "-X", "POST", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+        except subprocess.TimeoutExpired:
+            # Breed не успел ответить - вероятно, уже уходит в ребут
+            print(c("    Breed не ответил, возможно уходит в ребут...", C_CYAN))
+            if wait_gone(ip, timeout):
+                return True
+            continue
+        except Exception as e:
+            print(f"    ошибка запроса: {e}")
+            continue
+
+        # Даём Breed секунду на старт ребута и смотрим, не пропал ли роутер
+        if wait_gone(ip, timeout):
+            return True
+    return False
+
+
+def wait_gone(ip, timeout=15):
+    """Ждёт, пока роутер пропадёт из сети. True - пропал."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _stop:
+            return False
+        if not ping_router(ip):
+            print(c("  [+] Роутер ушёл в перезагрузку", C_CYAN))
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_back_only(ip, back_timeout=150):
+    """Ждёт возвращения роутера в сеть (ребут уже отправлен)."""
+    for _ in range(int(back_timeout / 0.5)):
+        if _stop:
+            return False
+        if ping_router(ip):
+            print(c("  [+] Роутер вернулся в сеть!", C_GREEN))
+            time.sleep(2.0)   # веб-сервер Breed поднимается не мгновенно
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_router_back(ip, gone_timeout=60, back_timeout=120):
+    """Ручной ребут: ждёт пропадания роутера, затем возвращения.
+
+    Используется как запасной вариант, если Breed не смог перезагрузить
+    устройство сам. Breed после правки MAC сам не перезагружается, в этом
+    режиме перезагрузку делает оператор кнопкой питания.
     """
     print()
     print(c("=" * 62, C_BOLD))
     print(c(" НУЖНА ПЕРЕЗАГРУЗКА РОУТЕРА", C_YELLOW))
     print(c("=" * 62, C_YELLOW))
+    print("  Breed не смог перезагрузить роутер сам.")
     print("  Нажмите питание на роутере (выкл/вкл) и дождитесь,")
     print(f"  пока он снова ответит на {ip}.")
     print("-" * 62)
@@ -275,12 +346,31 @@ def main():
         print(c("\n❌ Не удалось записать MAC в Breed. Конвейер остановлен.", C_RED))
         return 1
 
+    # --- Ребут роутера через Breed, иначе просим нажать питание ---
     if args.skip_reboot_wait:
         print()
         print(c("[!] --skip-reboot-wait: ожидание ребута пропущено.", C_YELLOW))
-    elif not wait_router_back(args.router_ip):
-        print(c("\n❌ Роутер не вернулся после ребута. Конвейер остановлен.", C_RED))
-        return 1
+    else:
+        print()
+        print(c("=" * 62, C_BOLD))
+        print(c(" ПЕРЕЗАГРУЗКА РОУТЕРА ЧЕРЕЗ BREED", C_BOLD))
+        print(c("=" * 62, C_BOLD))
+        print(f"  Отправляю команду ребута на {args.router_ip} через веб-интерфейс Breed.")
+        print("  Если Breed не умеет - скрипт попросит нажать питание вручную.")
+        print("-" * 62)
+
+        if try_reboot_via_breed(args.router_ip):
+            print()
+            print("[*] Ребут отправлен, жду возвращения роутера в сеть...")
+            if not wait_back_only(args.router_ip):
+                print(c("\n❌ Роутер не вернулся после ребута. Конвейер остановлен.", C_RED))
+                return 1
+        else:
+            print()
+            print(c("  [!] Breed не смог перезагрузить роутер, перехожу на ручной режим.", C_YELLOW))
+            if not wait_router_back(args.router_ip):
+                print(c("\n❌ Роутер не вернулся после ребута. Конвейер остановлен.", C_RED))
+                return 1
 
     if _stop:
         return 1
