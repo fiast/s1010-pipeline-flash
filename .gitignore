@@ -13,6 +13,16 @@ __pycache__/
 cookies.txt
 *.log
 
+# Пароли и учётные данные стенда (НИКОГДА не коммитить)
+*.password
+*.secret
+password.txt
+routers.local.yml
+.env
+
 # ОС
 .DS_Store
 Thumbs.db
+
+# Служебный мусор от curl
+stdout
