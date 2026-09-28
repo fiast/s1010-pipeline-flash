@@ -231,34 +231,28 @@ def main():
     if not write_mac_to_breed(args.breed_ip, mac):
         return 1
 
-    # ---------- 4. Ребут ----------
-    step_banner("ШАГ 4/6: ПЕРЕЗАГРУЗКА СРЕДСТВАМИ BREED")
-    print("[*] Отправляю команду ребута...")
-    if not reboot_via_breed(args.breed_ip):
-        print(c("  [!] Breed не смог перезагрузить роутер.", C_YELLOW))
-        print("      Нажмите питание на роутере и дождитесь возврата в сеть.")
-    if not wait_back(args.breed_ip, timeout=240, label="роутер в Breed"):
-        print(c("[-] Роутер не вернулся после ребута. Останов.", C_RED))
-        return 1
-
-    # ВАЖНО: порядок именно такой.
-    #   Breed -> пишем U-Boot -> перезагрузка -> на том же адресе
-    #   приходит U-Boot -> в него кладём прошивку Wive-NG.
-    # Обратный порядок невозможен: после записи U-Boot Breed исчезает.
-    step_banner("ШАГ 5/6: ЗАЛИВКА U-BOOT, ПРОШИВКА WIVE-NG И ПРИЁМКА")
+    # ---------- 4. Заливка U-Boot из Breed ----------
+    # Порядок именно такой: сначала заливаем U-Boot, и только потом
+    # вызываем перезагрузку. Ребут в Breed инициирует ту же перезагрузку,
+    # что и запись U-Boot, поэтому лишний круг не нужен.
+    step_banner("ШАГ 4/6: ЗАЛИВКА U-BOOT ИЗ BREED")
     wive = os.path.join(HERE, "wive-ng-s1010.bin")
     uboot = os.path.join(HERE, "uboot-s1010-wive.bin")
 
-    print("[*] Заливаю U-Boot из Breed...")
+    print("[*] Заливаю U-Boot в Breed (поле boot_file)...")
     res = upload_to_breed(args.breed_ip, uboot, field="boot_file")
     if res is False:
         print(c("[-] U-Boot не залит", C_RED))
         return 1
-    print("[*] Жду перезагрузки после записи U-Boot...")
-    if not wait_gone(args.breed_ip, timeout=120):
-        print(c("  [!] роутер не пропал из сети, жду возврата", C_YELLOW))
+
+    # ---------- 5. Ребут и переход в U-Boot ----------
+    step_banner("ШАГ 5/6: ПЕРЕЗАГРУЗКА И ПЕРЕХОД В U-BOOT")
+    print("[*] Отправляю команду ребута из Breed...")
+    if not reboot_via_breed(args.breed_ip):
+        print(c("  [!] Breed не смог перезагрузить роутер.", C_YELLOW))
+        print("      Нажмите питание на роутере и дождитесь возврата в сеть.")
     if not wait_back(args.breed_ip, timeout=300, label="роутер"):
-        print(c("[-] Роутер не вернулся после записи U-Boot", C_RED))
+        print(c("[-] Роутер не вернулся после ребута. Останов.", C_RED))
         return 1
 
     # На 192.168.1.1 теперь должен быть U-Boot, а не Breed

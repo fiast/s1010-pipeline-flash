@@ -271,6 +271,12 @@ def upload_to_breed(ip, path, field="firmware", timeout=900):
 
     Breed: POST /upload.html с полем boot_file для U-Boot,
            POST /            с полем firmware для прошивки.
+
+    Breed НЕ отдаёт 200: приняв файл, он сразу стартует перезагрузку
+    и отвечает редиректом 302 Found / Location: /. Это нормальный
+    признак успеха, а не ошибка. Поэтому успех определяем по коду
+    2xx или 3xx, а 2xx+таймаут тоже считаем успехом - устройство
+    могло уйти в ребут не успев ответить.
     """
     name = os.path.basename(path)
     size = os.path.getsize(path)
@@ -282,12 +288,23 @@ def upload_to_breed(ip, path, field="firmware", timeout=900):
             "-F", f"{field}=@{path}",
         ], timeout=timeout)
     except subprocess.TimeoutExpired:
-        print(c(f"  [-] таймаут отправки {name} (устройство могло уйти в ребут)", C_YELLOW))
-        return None
+        # Breed принял файл и ушёл в ребут, не успев ответить.
+        print(c(f"  [+] {name} отправлен, Breed ушёл в перезагрузку", C_GREEN))
+        return True
     text = (proc.stdout or b"").decode("utf-8", "ignore")
-    if "200 OK" in text or "successfully" in text:
+    head = text[:200]
+
+    # 2xx и 3xx - файл принят. Breed отвечает 302, потому что сразу
+    # перезагружается после приёма файла.
+    if ("200 OK" in head or "302 Found" in head or "303" in head
+            or "successfully" in text):
         print(c(f"  [+] {name} принят устройством", C_GREEN))
         return True
+
+    if "400" in head or "500" in head or "404" in head:
+        print(c(f"  [-] {name}: устройство отклонило файл - {head.splitlines()[0]}", C_RED))
+        return False
+
     if text.strip():
         print(c(f"  [!] неоднозначный ответ на {name}: {text.strip()[:150]}", C_YELLOW))
     return False
