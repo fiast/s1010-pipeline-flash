@@ -125,6 +125,47 @@ def wait_gone(ip, timeout=25):
     return False
 
 
+def probe_web(ip, timeout=10):
+    """Запрашивает корень и возвращает (текст, код). Пусто - не отвечает."""
+    try:
+        proc = breed_curl(["-i", f"http://{ip}/"], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return b"", 0
+    return proc.stdout or b"", 0
+
+
+def is_breed(body):
+    return b"Breed" in body
+
+
+def is_uboot(body):
+    """Признак U-Boot: сервер uIP и страница обновления прошивки."""
+    low = body.lower()
+    return b"uip" in low or b"firmware update" in low or b"uboot" in low
+
+
+def wait_for_stage(ip, predicate, what, timeout=240):
+    """Ждёт, пока веб интерфейса начнёт отвечать признаком predicate.
+
+    Нужно, потому что Breed и U-Boot живут на одном адресе 192.168.1.1
+    и отличаются только содержимым главной страницы: после записи
+    U-Boot и перезагрузки на том же IP приходит уже U-Boot.
+    """
+    print(f"[*] Жду {what} на {ip}...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _stop:
+            return False
+        body, _ = probe_web(ip)
+        if body and predicate(body):
+            print(c(f"[+] {what} отвечает", C_GREEN))
+            time.sleep(1.0)
+            return True
+        time.sleep(1.0)
+    print(c(f"[-] {what} не появился за {timeout:.0f} с", C_RED))
+    return False
+
+
 def wait_back(ip, timeout=180, label="роутер"):
     """Ждёт возвращения узла в сеть после перезагрузки."""
     deadline = time.time() + timeout
@@ -383,37 +424,47 @@ def main():
             print(c("[-] Роутер не вернулся. Останов.", C_RED))
             return 1
 
-    # ВАЖНО: сначала прошивка, затем U-Boot последним.
-    # После записи U-Boot загрузчик Breed исчезает, и прошивку уже некуда писать.
+    # ВАЖНО: порядок именно такой.
+    # Сначала пишем U-Boot из Breed, перезагружаем, и на том же адресе
+    # 192.168.1.1 приходит уже U-Boot (страница FIRMWARE UPDATE).
+    # Затем в U-Boot кладём прошивку Wive-NG.
+    # Обратный порядок нельзя: заливка прошивки в Breed после записи
+    # U-Boot невозможна - Breed к тому моменту уже заменён.
     wive = os.path.join(HERE, "wive-ng-s1010.bin")
     uboot = os.path.join(HERE, "uboot-s1010-wive.bin")
 
-    print("[*] Заливаю прошивку Wive-NG в Breed...")
-    res = upload_to_breed(args.breed_ip, wive, field="firmware")
-    if res is False:
-        print(c("[-] Прошивка Wive-NG не залита", C_RED))
-        return 1
-    print("[*] Жду перезагрузки после записи прошивки...")
-    if not wait_gone(args.breed_ip, timeout=60):
-        print(c("  [!] роутер не пропал из сети", C_YELLOW))
-    if not wait_back(args.breed_ip, timeout=300, label="роутер в Breed"):
-        print(c("[-] Роутер не вернулся после записи прошивки", C_RED))
-        return 1
-
-    print("[*] Заливаю U-Boot последним шагом...")
+    print("[*] Заливаю U-Boot из Breed...")
     res = upload_to_breed(args.breed_ip, uboot, field="boot_file")
     if res is False:
         print(c("[-] U-Boot не залит", C_RED))
         return 1
-    if res is None:
-        wait_back(args.breed_ip, timeout=300, label="роутер")
-    else:
-        print("[*] Жду перезагрузки после записи U-Boot...")
-        if not wait_gone(args.breed_ip, timeout=90):
-            print(c("  [!] роутер не пропал из сети, жду возврата", C_YELLOW))
-        if not wait_back(args.breed_ip, timeout=300, label="роутер"):
-            print(c("[-] Роутер не вернулся после записи U-Boot", C_RED))
-            return 1
+    print("[*] Жду перезагрузки после записи U-Boot...")
+    if not wait_gone(args.breed_ip, timeout=120):
+        print(c("  [!] роутер не пропал из сети, жду возврата", C_YELLOW))
+    if not wait_back(args.breed_ip, timeout=300, label="роутер"):
+        print(c("[-] Роутер не вернулся после записи U-Boot", C_RED))
+        return 1
+
+    # Теперь на 192.168.1.1 должен быть U-Boot, а не Breed
+    if not wait_for_stage(args.breed_ip, is_uboot, "загрузчик U-Boot", timeout=240):
+        print(c("[-] U-Boot не поднялся.", C_RED))
+        print(c("    Если вместо U-Boot пришёл Breed - загрузчик не записался.", C_YELLOW))
+        print(c("    Если страницы нет вовсе - U-Boot записан, но не запускается.", C_YELLOW))
+        return 1
+
+    print("[*] Заливаю прошивку Wive-NG в U-Boot...")
+    res = upload_to_breed(args.breed_ip, wive, field="firmware")
+    if res is False:
+        print(c("[-] Прошивка Wive-NG не залита", C_RED))
+        return 1
+    print("[*] Прошивка идёт, жду загрузки Wive-NG (до 4 минут)...")
+    if not wait_gone(args.breed_ip, timeout=120):
+        print(c("  [!] роутер пока не пропал из сети", C_YELLOW))
+    if not wait_for_stage(args.breed_ip,
+                          lambda b: b"wive" in b.lower() or b"nginx" in b.lower(),
+                          "систему Wive-NG", timeout=300):
+        print(c("[-] Wive-NG не загрузился. Останов.", C_RED))
+        return 1
 
     # ---------- 5. Приёмка ----------
     step_banner("ШАГ 5/5: ОЖИДАНИЕ WIVE-NG И ПРИЁМКА")

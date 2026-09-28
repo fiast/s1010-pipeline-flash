@@ -85,8 +85,10 @@ def check_router_status():
         # 3. Парсим данные регулярными выражениями прямо из текста JS-файла
         sdk_version_match = re.search(r"statusSDKversion_value'\)\.innerHTML\s*=\s*'([^']+)'", js_content)
         lan_mac_match = re.search(r"statusLANMAC_value'\)\.innerHTML\s*=\s*'([^']+)'", js_content)
+        wan_mac_match = re.search(r"statusWANMAC_value'\)\.innerHTML\s*=\s*'([^']+)'", js_content)
         sdk_version = sdk_version_match.group(1) if sdk_version_match else "Не найдено"
         lan_mac = lan_mac_match.group(1) if lan_mac_match else "Не найдено"
+        wan_mac = wan_mac_match.group(1) if wan_mac_match else ""
         # Если в версии SDK летит длинная строка '9.2.0.RU.31122024 / ...', забираем только первую часть
         if ' / ' in sdk_version:
             sdk_version = sdk_version.split(' / ')[0]
@@ -96,6 +98,8 @@ def check_router_status():
         print("🎉 [ПРИЕМКА РЕЗУЛЬТАТОВ: ВСЕ ОТЛИЧНО!]")
         print(f"🔹 Версия прошивки: {sdk_version}")
         print(f"🔹 Текущий LAN MAC:  {lan_mac.upper()}")
+        if wan_mac:
+            print(f"🔹 Текущий WAN MAC:  {wan_mac.upper()}")
         print("="*50 + "\n")
         return True
 
