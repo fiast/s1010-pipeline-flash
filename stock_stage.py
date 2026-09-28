@@ -36,6 +36,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 STOCK_IP = os.environ.get("S1010_STOCK_IP") or "192.168.0.1"
 STOCK_LOGIN = os.environ.get("S1010_STOCK_USER") or "admin"
 
+# Каталог проекта - здесь ищем файлы прошивок по умолчанию
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 # Заголовки обязательны: без Accept-Language сервер отвечает 400
 HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
@@ -148,6 +151,38 @@ class StockSession:
             return False
 
     # ---------- вход ----------
+    def resolve_breed_file(self, given):
+        """Находит файл образа Breed.
+
+        Имя может быть указано с любым вариантом написания
+        (breed_s1010.img / breed-s1010.img / breed-rt-fl-1.img), поэтому
+        при неудаче ищем в каталоге проекта по шаблону.
+        """
+        if given and os.path.isabs(given) and os.path.exists(given):
+            return given
+        if given and not os.path.isabs(given):
+            cand = os.path.join(HERE, given)
+            if os.path.exists(cand):
+                return cand
+            # вариант с другим разделителем
+            alt = given.replace("-", "_").replace("_", "-")
+            for name in {given, alt}:
+                cand = os.path.join(HERE, name)
+                if os.path.exists(cand):
+                    return cand
+        # автопоиск в каталоге проекта
+        try:
+            entries = sorted(os.listdir(HERE))
+        except OSError:
+            return None
+        for name in entries:
+            low = name.lower()
+            if not low.startswith("breed"):
+                continue
+            if low.endswith((".img", ".bin")):
+                return os.path.join(HERE, name)
+        return None
+
     def _get_encryption_material(self):
         """Забирает encryption_key и delay_time из user_lang.json.
 
@@ -229,43 +264,111 @@ class StockSession:
         return False
 
     # ---------- чтение MAC ----------
-    def read_mac(self, endpoint="settings_wan2", field="wan_mac"):
-        """Читает MAC роутера из data/<endpoint>.json.
+    # Роутер отдаёт несколько MAC, и они не равны базовому:
+    #   14:2E:5E:8B:51:BA - базовый LAN/RF1 (реальный L2, виден в ARP)
+    #   ...:BB              - WLAN 2.4     (base+1)
+    #   ...:BC              - WLAN 5      (base+2)  это wifi_mac_address
+    #   ...:C4              - WAN         (base+10) это settings_wan2.wan_mac
+    # В Breed пишется базовый, от него считаются WLAN. Поэтому берём
+    # именно базовый, а не wan_mac: он отличается на +10.
+    MAC_OFFSETS = {
+        "arp": 0,          # фактический L2-адрес устройства
+        "status": 2,       # wifi_mac_address = base+2
+        "wan2": 10,        # settings_wan2.wan_mac = base+10
+    }
 
-        В провайдерской прошивке MAC хранится в settings_wan2.json
-        в поле wan_mac; запасные источники - lan_mac и общий разбор.
-        """
+    def read_mac_from_arp(self):
+        """Базовый MAC из ARP-таблицы хоста - самый прямой источник."""
+        import subprocess
+        for cmd in (["ip", "neigh", "show"],
+                    ["arp", "-n"],
+                    ["arp", "-a"]):
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, timeout=8, text=True)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            for line in (p.stdout or "").splitlines():
+                if self.ip not in line:
+                    continue
+                m = re.search(r"(?:lladdr\s+|at\s+)?([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})",
+                              line)
+                if m:
+                    return normalize_mac(m.group(1))
+        return None
+
+    def read_mac_from_wifi_field(self):
+        """base+2 из поля wifi_mac_address (страница status-and-support)."""
+        ref = {"Referer": self.base + "/status-and-support.html", "Origin": self.base}
+        url = (f"{self.base}/statusandsupport/status.html"
+               f"?_={int(time.time() * 1000)}&csrf_token={self.csrf}")
+        try:
+            r = self.s.get(url, headers=ref, timeout=20)
+        except requests.RequestException:
+            return None
+        m = re.search(r'id="wifi_mac_address"[^>]*>\s*([0-9A-Fa-f:]{17})',
+                      r.text or "")
+        return normalize_mac(m.group(1)) if m else None
+
+    def read_mac_from_wan2(self):
+        """Сырое значение settings_wan2.wan_mac (= base+10), без поправки."""
+        return self._wan2_mac()
+
+    def _wan2_mac(self):
         ref = {"Referer": self.base + "/settings.html", "Origin": self.base}
         try:
-            r = self.s.get(self.data_url(endpoint), headers=ref, timeout=20)
+            r = self.s.get(self.data_url("settings_wan2"), headers=ref, timeout=20)
             data = json.loads(r.text)
-        except (requests.RequestException, ValueError) as e:
-            self.say(f"[-] {endpoint}.json недоступен: {e}")
+        except (requests.RequestException, ValueError):
+            return None
+        for item in data:
+            if isinstance(item, dict) and "wan_mac" in item:
+                norm = normalize_mac(item["wan_mac"])
+                if norm and not mac_is_invalid(norm):
+                    return norm
+        return None
+
+    def read_mac(self):
+        """Определяет базовый MAC роутера, сверяя несколько источников.
+
+        Каждый источник даёт свой MAC со своим смещением относительно
+        базового. Базовый получается вычитанием смещения. Результаты
+        сверяются между собой - это защита от тихой ошибки, когда
+        читается не тот адрес.
+        """
+        candidates = [
+            ("ARP (базовый)", self.read_mac_from_arp(), 0),
+            ("wifi_mac_address", self.read_mac_from_wifi_field(), 2),
+            ("settings_wan2.wan_mac", self.read_mac_from_wan2(), 10),
+        ]
+
+        results = {}
+        for name, raw, offset in candidates:
+            if not raw:
+                self.say(f"  [i] источник {name}: не получен")
+                continue
+            base = f"{int(raw, 16) - offset:012X}"
+            results[name] = base
+            self.say(f"  [i] {name} = {raw} (base+{offset}) -> базовый {base}")
+
+        if not results:
+            self.say("[-] Не удалось определить MAC роутера")
             return None
 
-        found = {}
-        for item in data:
-            if isinstance(item, dict):
-                for key, val in item.items():
-                    norm = normalize_mac(val)
-                    if norm and not mac_is_invalid(norm):
-                        found.setdefault(key, norm)
+        unique = set(results.values())
+        if len(unique) > 1:
+            self.say("[-] Источники дают РАЗНЫЕ базовые MAC - данные не сходятся:")
+            for name, val in results.items():
+                self.say(f"      {name:24} = {val}")
+            return None
 
-        mac = found.get(field)
-        if mac is None:
-            # берём первый осмысленный MAC
-            for key in ("lan_mac", "wan_mac", "mac", "mac_address"):
-                if key in found:
-                    mac = found[key]
-                    break
-        if mac is None and found:
-            mac = next(iter(found.values()))
+        mac = unique.pop()
+        if mac_is_invalid(mac):
+            self.say(f"[-] Получен некорректный MAC: {mac}")
+            return None
 
-        if mac:
-            pretty = ":".join(mac[i:i + 2] for i in range(0, 12, 2))
-            self.say(f"[+] MAC роутера: {pretty}")
-        else:
-            self.say(f"[-] MAC в {endpoint}.json не найден")
+        pretty = ":".join(mac[i:i + 2] for i in range(0, 12, 2))
+        self.say(f"[+] Базовый MAC роутера: {pretty} (источники сошлись)")
         return mac
 
     # ---------- загрузка прошивки ----------

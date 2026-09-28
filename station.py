@@ -344,13 +344,12 @@ def main():
             return 1
     print(f"[i] запомнил MAC роутера: {fmt(mac)}")
 
-    breed_path = args.breed_file
-    if not os.path.isabs(breed_path):
-        breed_path = os.path.join(HERE, breed_path)
-    if not os.path.exists(breed_path):
-        print(f"[-] Файл Breed не найден: {breed_path}")
-        print("    Укажите путь ключом --breed-file")
+    breed_path = stock.resolve_breed_file(args.breed_file)
+    if not breed_path:
+        print(f"[-] Файл Breed не найден. Искали: {args.breed_file}")
+        print("    Положите образ в каталог проекта или укажите --breed-file")
         return 1
+    print(f"[*] Файл Breed: {breed_path} ({os.path.getsize(breed_path)} байт)")
 
     print(f"[*] Заливаю Breed: {os.path.basename(breed_path)}")
     ok, detail = stock.upload_firmware(breed_path)
