@@ -374,6 +374,38 @@ class StockSession:
     # ---------- загрузка прошивки ----------
     UPLOAD_CGI = "/upload.cgi"
     MAX_FILE_SIZE = 102476800      # ограничение формы, из settings_fw_update.js
+    BOUNDARY = "----S1010BreedUploadBoundary"
+
+    def _multipart_body(self, path):
+        """Собирает multipart/form-data вручную, целиком в памяти.
+
+        Зачем вручную: при files={...} requests отправляет multipart
+        через Transfer-Encoding: chunked, без Content-Length. Встроенный
+        httpd роутера читает Content-Length и при его отсутствии
+        отвечает "CONTENT_LENGTH is NULL", отклоняя файл.
+        """
+        name = os.path.basename(path)
+        with open(path, "rb") as f:
+            payload = f.read()
+
+        sep = b"\r\n"
+        parts = []
+        for key, val in (("MAX_FILE_SIZE", str(self.MAX_FILE_SIZE)),
+                         ("uploadType", "image")):
+            parts.append(
+                f"--{self.BOUNDARY}".encode() + sep
+                + f'Content-Disposition: form-data; name="{key}"'.encode() + sep
+                + sep
+                + str(val).encode() + sep)
+        parts.append(
+            f"--{self.BOUNDARY}".encode() + sep
+            + f'Content-Disposition: form-data; name="uploadedfile"; '
+              f'filename="{name}"'.encode() + sep
+            + b"Content-Type: application/octet-stream" + sep + sep
+            + payload + sep)
+        parts.append(f"--{self.BOUNDARY}--".encode() + b"\r\n")
+
+        return b"".join(parts), len(payload)
 
     def upload_firmware(self, filename, timeout=600, verbose=True):
         """Загружает файл прошивки (Breed) через upload.cgi.
@@ -393,17 +425,15 @@ class StockSession:
         if size > self.MAX_FILE_SIZE:
             return False, f"файл {size} байт больше лимита {self.MAX_FILE_SIZE}"
 
-        ref = {"Referer": self.base + "/settings.html", "Origin": self.base}
+        ref = {"Referer": self.base + "/settings.html", "Origin": self.base,
+               "Content-Type": f"multipart/form-data; boundary={self.BOUNDARY}"}
         try:
-            with open(path, "rb") as f:
-                resp = self.s.post(
-                    self.base + self.UPLOAD_CGI,
-                    files={"uploadedfile": (os.path.basename(path), f,
-                                            "application/octet-stream")},
-                    data={"MAX_FILE_SIZE": str(self.MAX_FILE_SIZE),
-                          "uploadType": "image"},
-                    headers=ref, timeout=timeout,
-                )
+            body, _ = self._multipart_body(path)
+            resp = self.s.post(
+                self.base + self.UPLOAD_CGI,
+                data=body,
+                headers=ref, timeout=timeout,
+            )
         except requests.RequestException as e:
             return False, f"ошибка отправки файла: {e}"
         except OSError as e:
