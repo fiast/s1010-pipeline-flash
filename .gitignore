@@ -1,0 +1,18 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Служебные файлы
+cookies.txt
+*.log
+
+# ОС
+.DS_Store
+Thumbs.db
