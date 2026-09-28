@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import re
+import subprocess
 import time
 
 import requests
@@ -407,6 +408,42 @@ class StockSession:
 
         return b"".join(parts), len(payload)
 
+    def _session_cookie_header(self):
+        """Собирает заголовок Cookie из сессии requests для передачи в curl."""
+        parts = []
+        for c in self.s.cookies:
+            parts.append(f"{c.name}={c.value}")
+        return "; ".join(parts)
+
+    def _upload_via_curl(self, path, timeout):
+        """Загрузка файла системным curl.
+
+        Зачем curl: встроенный httpd роутера капризен к multipart от
+        requests и отвечает "CONTENT_LENGTH is NULL". curl всегда
+        собирает тело целиком и отправляет с заголовком Content-Length,
+        плюс сам обрабатывает multipart-разделители.
+        """
+        url = f"{self.base}/upload.cgi"
+        cmd = [
+            "curl", "-s", "-i",
+            "--max-time", str(timeout),
+            "-X", "POST", url,
+            "-H", f"Accept-Language: {HEADERS['Accept-Language']}",
+            "-H", f"Referer: {self.base}/settings.html",
+            "-H", f"Origin: {self.base}",
+            "-H", f"Cookie: {self._session_cookie_header()}",
+            "-F", f"MAX_FILE_SIZE={self.MAX_FILE_SIZE}",
+            "-F", "uploadType=image",
+            "-F", f"uploadedfile=@{path}",
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=timeout + 15)
+        except subprocess.TimeoutExpired:
+            return None, "таймаут отправки через curl"
+        return (proc.stdout or b"").decode("utf-8", "ignore"), None
+
     def upload_firmware(self, filename, timeout=600, verbose=True):
         """Загружает файл прошивки (Breed) через upload.cgi.
 
@@ -425,30 +462,25 @@ class StockSession:
         if size > self.MAX_FILE_SIZE:
             return False, f"файл {size} байт больше лимита {self.MAX_FILE_SIZE}"
 
-        ref = {"Referer": self.base + "/settings.html", "Origin": self.base,
-               "Content-Type": f"multipart/form-data; boundary={self.BOUNDARY}"}
-        try:
-            body, _ = self._multipart_body(path)
-            resp = self.s.post(
-                self.base + self.UPLOAD_CGI,
-                data=body,
-                headers=ref, timeout=timeout,
-            )
-        except requests.RequestException as e:
-            return False, f"ошибка отправки файла: {e}"
-        except OSError as e:
-            return False, f"ошибка чтения файла: {e}"
+        body, err = self._upload_via_curl(path, timeout)
+        if err:
+            return False, err
+        if body is None:
+            body = ""
 
-        body = resp.text or ""
+        head = body[:200]
         low = body.lower()
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}"
-        for bad in ("error", "fail", "invalid", "not supported", "wrong"):
-            if bad in low:
-                return False, f"устройство отклонило файл: {body.strip()[:120]}"
+        if "content_length is null" in low:
+            return False, ("роутер не увидел Content-Length "
+                           f"(тело {size} байт)")
+        if resp_ok := ("200 ok" in head.lower()):
+            if verbose:
+                self.say(f"[+] {os.path.basename(path)} ({size} байт) залит")
+            return True, "файл принят устройством"
+        if "error" in low or "400" in head or "500" in head:
+            clean = " ".join(body.split())[:160]
+            return False, f"устройство отклонило файл: {clean}"
         if verbose:
-            self.say(f"[+] Файл {os.path.basename(path)} "
-                     f"({size} байт) отправлен, HTTP {resp.status_code}")
-            if body.strip():
-                self.say(f"    ответ: {body.strip()[:150]}")
-        return True, "файл принят устройством"
+            self.say(f"[+] {os.path.basename(path)} ({size} байт) отправлен, "
+                     f"ответ: {' '.join(body.split())[:120]}")
+        return True, "файл отправлен"
